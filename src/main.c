@@ -5,6 +5,7 @@
 #include <pspiofilemgr.h>
 #include <pspgu.h>
 #include <pspsysmem.h>
+#include <pspmodulemgr.h>
 #include <stdint.h>
 #include <string.h>
 #include <lua.h>
@@ -28,6 +29,13 @@ static unsigned int buttons_current, buttons_previous;
 
 #define MOD_BIN_MAX_SIZE (16 * 1024)
 #define MAX_MOD_HOOKS 128
+#define MAX_FILE_REDIRECTS 16
+#define MAX_ARCHIVE_REPLACEMENTS 32
+#define MAX_IO_STUBS 8
+#define REDIRECT_PATH_SIZE 192
+#define FUC_NATIVEPSP_PATH "ms0:/PSP/SAVEDATA/FUCDAT/NATIVEPSP"
+#define FUC_FILE_BIN_PATH FUC_NATIVEPSP_PATH "/FILE.BIN"
+#define FUC_FILE_BIN_SIZE 826
 
 typedef struct
 {
@@ -39,6 +47,34 @@ typedef struct
 static unsigned char mod_file_buffer[MOD_BIN_MAX_SIZE];
 static ModHook mod_hooks[MAX_MOD_HOOKS];
 static int mod_hook_count;
+
+typedef struct
+{
+   char owner[24];
+   char source[REDIRECT_PATH_SIZE];
+   char replacement[REDIRECT_PATH_SIZE];
+} FileRedirect;
+
+typedef struct
+{
+   uint32_t *address;
+   uint32_t original[2];
+} IoStubHook;
+
+static FileRedirect file_redirects[MAX_FILE_REDIRECTS];
+static int file_redirect_count;
+static IoStubHook io_stub_hooks[MAX_IO_STUBS];
+static int io_stub_hook_count;
+static uint32_t io_open_trampoline[2] __attribute__((aligned(16)));
+
+typedef struct
+{
+   char owner[24];
+   unsigned short file_id;
+} ArchiveReplacement;
+
+static ArchiveReplacement archive_replacements[MAX_ARCHIVE_REPLACEMENTS];
+static int archive_replacement_count;
 
 #define MAX_VERTICES 4096
 typedef struct
@@ -248,6 +284,240 @@ static void sync_code(void *start, unsigned int size)
    sceKernelIcacheInvalidateRange(start, size);
 }
 
+static int path_equal(const char *a, const char *b)
+{
+   while (*a && *b)
+   {
+      unsigned char ca = (unsigned char)*a++, cb = (unsigned char)*b++;
+      if (ca == '\\') ca = '/';
+      if (cb == '\\') cb = '/';
+      if (ca >= 'A' && ca <= 'Z') ca += 'a' - 'A';
+      if (cb >= 'A' && cb <= 'Z') cb += 'a' - 'A';
+      if (ca != cb) return 0;
+   }
+   return *a == *b;
+}
+
+static SceUID redirected_io_open(const char *file, int flags, SceMode mode)
+{
+   int i;
+   typedef SceUID (*IoOpenFunction)(const char *, int, SceMode);
+   for (i = file_redirect_count - 1; i >= 0; i--)
+      if (path_equal(file, file_redirects[i].source))
+         return ((IoOpenFunction)io_open_trampoline)(file_redirects[i].replacement, flags, mode);
+   return ((IoOpenFunction)io_open_trampoline)(file, flags, mode);
+}
+
+static int install_io_hook(lua_State *s)
+{
+   SceUID modules[64];
+   int count = 0, i;
+   SceKernelModuleInfo game_info;
+   int found_game = 0;
+   uintptr_t own_stub = (uintptr_t)sceIoOpen;
+   uint32_t expected_jr = 0x03E00008u;
+   uint32_t expected_syscall = ((volatile uint32_t *)own_stub)[1];
+   if (io_stub_hook_count) return 0;
+   io_open_trampoline[0] = expected_jr;
+   io_open_trampoline[1] = expected_syscall;
+   sync_code(io_open_trampoline, sizeof(io_open_trampoline));
+   if (sceKernelGetModuleIdList(modules, sizeof(modules), &count) < 0)
+      return luaL_error(s, "could not enumerate game modules");
+   if (count > (int)(sizeof(modules) / sizeof(modules[0])))
+      count = sizeof(modules) / sizeof(modules[0]);
+   memset(&game_info, 0, sizeof(game_info));
+   for (i = 0; i < count; i++)
+   {
+      SceKernelModuleInfo info;
+      memset(&info, 0, sizeof(info));
+      info.size = sizeof(info);
+      if (sceKernelQueryModuleInfo(modules[i], &info) < 0 || info.text_addr < USER_RAM_START ||
+          info.text_addr >= USER_RAM_END || !info.text_size)
+         continue;
+      if (!found_game || info.text_addr < game_info.text_addr)
+      {
+         game_info = info;
+         found_game = 1;
+      }
+   }
+   if (found_game)
+   {
+      uint32_t *p = (uint32_t *)(uintptr_t)game_info.text_addr;
+      uint32_t *end = (uint32_t *)((uintptr_t)p + game_info.text_size - 4);
+      for (; p < end; p++)
+         if ((uintptr_t)p != own_stub && p[0] == expected_jr && p[1] == expected_syscall)
+         {
+            uintptr_t destination = (uintptr_t)redirected_io_open;
+            if (io_stub_hook_count >= MAX_IO_STUBS)
+               return luaL_error(s, "too many sceIoOpen import stubs");
+            io_stub_hooks[io_stub_hook_count].address = p;
+            io_stub_hooks[io_stub_hook_count].original[0] = p[0];
+            io_stub_hooks[io_stub_hook_count].original[1] = p[1];
+            io_stub_hook_count++;
+            p[0] = 0x08000000u | ((destination >> 2) & 0x03FFFFFFu);
+            p[1] = 0;
+            sync_code(p, 8);
+         }
+   }
+   if (!io_stub_hook_count)
+      return luaL_error(s, "sceIoOpen import stub not found in game module");
+   return 0;
+}
+
+static int api_mod_redirect_file(lua_State *s)
+{
+   const char *owner = luaL_checkstring(s, 1);
+   const char *source = luaL_checkstring(s, 2);
+   const char *replacement = luaL_checkstring(s, 3);
+   int i;
+   luaL_argcheck(s, strlen(owner) > 0 && strlen(owner) < sizeof(file_redirects[0].owner), 1, "invalid mod ID");
+   luaL_argcheck(s, !strncmp(source, "disc0:/", 7) && !strstr(source, "..") && strlen(source) < REDIRECT_PATH_SIZE, 2,
+                 "source must be under disc0:/ and cannot contain ..");
+   luaL_argcheck(s, mod_path_allowed(replacement) && strlen(replacement) < REDIRECT_PATH_SIZE, 3,
+                 "replacement must be under ms0:/mods and cannot contain ..");
+   if (install_io_hook(s) != 0) return lua_error(s);
+   for (i = 0; i < file_redirect_count; i++)
+      if (!strcmp(file_redirects[i].owner, owner) && path_equal(file_redirects[i].source, source))
+         break;
+   if (i == file_redirect_count)
+   {
+      if (file_redirect_count >= MAX_FILE_REDIRECTS) return luaL_error(s, "file redirect limit reached");
+      file_redirect_count++;
+   }
+   strcpy(file_redirects[i].owner, owner);
+   strcpy(file_redirects[i].source, source);
+   strcpy(file_redirects[i].replacement, replacement);
+   return 0;
+}
+
+static int update_archive_bitmap(unsigned int file_id, int enabled)
+{
+   unsigned char bitmap[FUC_FILE_BIN_SIZE];
+   SceUID fd;
+   int length, written;
+   memset(bitmap, 0, sizeof(bitmap));
+   fd = sceIoOpen(FUC_FILE_BIN_PATH, PSP_O_RDONLY, 0);
+   if (fd >= 0)
+   {
+      length = sceIoRead(fd, bitmap, sizeof(bitmap));
+      sceIoClose(fd);
+      if (length < 0) return length;
+   }
+   if (enabled)
+      bitmap[file_id / 8] |= (unsigned char)(1u << (file_id % 8));
+   else
+      bitmap[file_id / 8] &= (unsigned char)~(1u << (file_id % 8));
+   fd = sceIoOpen(FUC_FILE_BIN_PATH, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+   if (fd < 0) return fd;
+   written = sceIoWrite(fd, bitmap, sizeof(bitmap));
+   sceIoClose(fd);
+   return written == (int)sizeof(bitmap) ? 0 : (written < 0 ? written : -1);
+}
+
+static int api_mod_replace_archive_file(lua_State *s)
+{
+   const char *owner = luaL_checkstring(s, 1);
+   unsigned int file_id = (unsigned int)luaL_checkinteger(s, 2);
+   const char *source = luaL_checkstring(s, 3);
+   char destination[96];
+   char digits[8];
+   SceUID input, output;
+   int length, result, i;
+   uint32_t size_header;
+   luaL_argcheck(s, strlen(owner) > 0 && strlen(owner) < sizeof(archive_replacements[0].owner), 1, "invalid mod ID");
+   luaL_argcheck(s, file_id < FUC_FILE_BIN_SIZE * 8, 2, "archive file ID must be between 0 and 6607");
+   luaL_argcheck(s, mod_path_allowed(source), 3, "replacement must be under ms0:/mods and cannot contain ..");
+   for (i = 0; i < archive_replacement_count; i++)
+      if (archive_replacements[i].file_id == file_id && strcmp(archive_replacements[i].owner, owner))
+         return luaL_error(s, "archive file ID %d is already owned by %s", file_id, archive_replacements[i].owner);
+   for (i = 0; i < archive_replacement_count; i++)
+      if (archive_replacements[i].file_id == file_id && !strcmp(archive_replacements[i].owner, owner)) break;
+   if (i == archive_replacement_count && archive_replacement_count >= MAX_ARCHIVE_REPLACEMENTS)
+      return luaL_error(s, "archive replacement limit reached");
+   input = sceIoOpen(source, PSP_O_RDONLY, 0);
+   if (input < 0) return luaL_error(s, "could not open %s: 0x%08X", source, (unsigned int)input);
+   length = sceIoLseek32(input, 0, PSP_SEEK_END);
+   sceIoLseek32(input, 0, PSP_SEEK_SET);
+   if (length <= 0)
+   {
+      sceIoClose(input);
+      return luaL_error(s, "invalid replacement size: %d", length);
+   }
+   sceIoMkdir("ms0:/PSP/SAVEDATA/FUCDAT", 0777);
+   sceIoMkdir(FUC_NATIVEPSP_PATH, 0777);
+   strcpy(destination, FUC_NATIVEPSP_PATH "/");
+   digits[0] = (char)('0' + (file_id / 1000) % 10);
+   digits[1] = (char)('0' + (file_id / 100) % 10);
+   digits[2] = (char)('0' + (file_id / 10) % 10);
+   digits[3] = (char)('0' + file_id % 10);
+   digits[4] = 0;
+   strcat(destination, digits);
+   output = sceIoOpen(destination, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+   if (output < 0)
+   {
+      sceIoClose(input);
+      return luaL_error(s, "could not create nativePSP file: 0x%08X", (unsigned int)output);
+   }
+   size_header = (uint32_t)length;
+   result = sceIoWrite(output, &size_header, sizeof(size_header));
+   while (result == (int)sizeof(size_header))
+   {
+      int read_length = sceIoRead(input, mod_file_buffer, MOD_BIN_MAX_SIZE);
+      if (read_length == 0) break;
+      if (read_length < 0 || sceIoWrite(output, mod_file_buffer, read_length) != read_length)
+      {
+         result = -1;
+         break;
+      }
+   }
+   sceIoClose(output);
+   sceIoClose(input);
+   if (result != (int)sizeof(size_header))
+      return luaL_error(s, "could not write nativePSP replacement");
+   result = update_archive_bitmap(file_id, 1);
+   if (result < 0) return luaL_error(s, "could not update FILE.BIN: 0x%08X", (unsigned int)result);
+   if (i == archive_replacement_count)
+   {
+      archive_replacement_count++;
+   }
+   strcpy(archive_replacements[i].owner, owner);
+   archive_replacements[i].file_id = (unsigned short)file_id;
+   return 0;
+}
+
+static void clear_file_redirects(const char *owner)
+{
+   int i;
+   for (i = file_redirect_count - 1; i >= 0; i--)
+      if (!owner || !strcmp(file_redirects[i].owner, owner))
+         file_redirects[i] = file_redirects[--file_redirect_count];
+}
+
+static void clear_archive_replacements(const char *owner)
+{
+   int i;
+   for (i = archive_replacement_count - 1; i >= 0; i--)
+      if (!owner || !strcmp(archive_replacements[i].owner, owner))
+      {
+         if (owner) update_archive_bitmap(archive_replacements[i].file_id, 0);
+         archive_replacements[i] = archive_replacements[--archive_replacement_count];
+      }
+}
+
+static void uninstall_io_hook(void)
+{
+   int i;
+   for (i = 0; i < io_stub_hook_count; i++)
+   {
+      uint32_t *p = io_stub_hooks[i].address;
+      p[0] = io_stub_hooks[i].original[0];
+      p[1] = io_stub_hooks[i].original[1];
+      sync_code(p, 8);
+   }
+   io_stub_hook_count = 0;
+   file_redirect_count = 0;
+}
+
 static int api_memory_dump(lua_State *s)
 {
    const char *path = luaL_checkstring(s, 1);
@@ -452,6 +722,8 @@ static int api_mod_disable(lua_State *s)
          sync_code((void *)mod_hooks[i].address, 4);
          mod_hooks[i] = mod_hooks[--mod_hook_count];
       }
+   clear_file_redirects(owner);
+   clear_archive_replacements(owner);
    return 0;
 }
 
@@ -461,6 +733,18 @@ static int api_mod_active(lua_State *s)
    int i;
    for (i = 0; i < mod_hook_count; i++)
       if (!strcmp(mod_hooks[i].owner, owner))
+      {
+         lua_pushboolean(s, 1);
+         return 1;
+      }
+   for (i = 0; i < file_redirect_count; i++)
+      if (!strcmp(file_redirects[i].owner, owner))
+      {
+         lua_pushboolean(s, 1);
+         return 1;
+      }
+   for (i = 0; i < archive_replacement_count; i++)
+      if (!strcmp(archive_replacements[i].owner, owner))
       {
          lua_pushboolean(s, 1);
          return 1;
@@ -510,6 +794,8 @@ static const luaL_Reg memory_api[] = {{"read8", api_read8}, {"read16", api_read1
 
 static const luaL_Reg mods_api[] = {{"list", api_mod_list}, {"load_state", api_mod_load_state}, {"save_state", api_mod_save_state},
                                     {"load_lua", api_mod_load_lua}, {"load_bin", api_mod_load_bin}, {"hook32", api_mod_hook32}, 
+                                    {"redirect_file", api_mod_redirect_file},
+                                    {"replace_archive_file", api_mod_replace_archive_file},
                                     {"disable", api_mod_disable}, {"is_active", api_mod_active}, {NULL, NULL}};
 
 static unsigned int button_mask(const char *name)
@@ -573,6 +859,7 @@ static int load_script(void)
    SceUID fd;
    int length;
    lua_State *n;
+   clear_file_redirects(NULL);
    if (vm)
    {
       lua_close(vm);
@@ -740,5 +1027,6 @@ int module_stop(SceSize args, void *argp)
    (void)args;
    (void)argp;
    running = 0;
+   uninstall_io_hook();
    return 0;
 }
