@@ -1,0 +1,17 @@
+/thirdparty/*
+!/thirdparty/.gitkeep
+
+/build/
+*.o
+*.elf
+*.prx
+exports.c
+PARAM.SFO
+EBOOT.PBP
+
+/output/
+__pycache__/
+*.py[cod]
+
+!example_mods/**/*.bin
+!example_mods/**/README.txt
