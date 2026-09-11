@@ -1,0 +1,23 @@
+return {
+    label = "MHFU US",
+    bin = { "HIT_CAPTURE_US.bin", 0x08921600 },
+    copy_matrix_bin = "COPY_MATRIX_US.bin",
+    copy_matrix_address = 0x08920AB0,
+    matrix = 0x08920AF8,
+    matrix_hook = { 0x0886941C, 0x0A2482AC },
+    node_table = 0x08921740,
+    screen_data = 0x08921900,
+    node_class = 0x089B5BD4,
+    parent_offset = 0x144,
+    position_offset = 0x100,
+    hitbox_scan_start = 0x09C14280,
+    hitbox_scan_end = 0x09D15100,
+    builder_capture_bin = { "HITBOX_BUILDER_CAPTURE_US.bin", 0x08921C00 },
+    builder_capture_jump = 0x0A248700,
+    builder_entry_jump = 0x0A248730,
+    builder_entry_return_slot = 0x08921CD8,
+    builder_capture_state = 0x08921660,
+    state = 0x08921640,
+    hook = { 0x09AC7AD4, 0x0A248580 },
+    expected = 0xA6A202E4
+}

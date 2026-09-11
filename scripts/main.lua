@@ -14,7 +14,12 @@ table.sort(mod_directories)
 for _, directory in ipairs(mod_directories) do
     local path = "ms0:/mods/" .. directory .. "/mod.lua"
     local ok, result = pcall(function() return mods.load_lua(path)() end)
-    if ok then table.insert(mod_list, result) else manager_message = short_error(result) end
+    if ok and type(result) == "table" then
+        result.settings = result.settings or {}
+        table.insert(mod_list, result)
+    else
+        manager_message = short_error(ok and "mod.lua did not return a mod table" or result)
+    end
 end
 
 local game_id = system.game_id() or "UNKNOWN"
@@ -106,6 +111,7 @@ end
 
 local function detail()
     local mod = mod_list[manager_selected]
+    mod.settings = mod.settings or {}
     local count = #mod.settings + 2
     frame(mod.name .. " MOD")
     if input.pressed("UP") then detail_selected = clamp(detail_selected - 1, 1, count) end
@@ -138,6 +144,7 @@ function draw()
     local combo = input.down("L") and input.down("R") and input.down("SELECT")
     if combo and not combo_was_down then panel_active = not panel_active end; combo_was_down = combo
     for _, mod in ipairs(mod_list) do if mod.update then mod.update() end end
+    for _, mod in ipairs(mod_list) do if mod.is_enabled() and mod.draw then mod.draw() end end
     if not panel_active then return end
     if screen == "manager" then manager() else detail() end
 end

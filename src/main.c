@@ -27,7 +27,7 @@ static int script_status;
 static char script_error[96];
 static unsigned int buttons_current, buttons_previous;
 
-#define MOD_BIN_MAX_SIZE (16 * 1024)
+#define MOD_BIN_MAX_SIZE (24 * 1024)
 #define MAX_MOD_HOOKS 128
 #define MAX_FILE_REDIRECTS 16
 #define MAX_ARCHIVE_REPLACEMENTS 32
@@ -77,6 +77,7 @@ static ArchiveReplacement archive_replacements[MAX_ARCHIVE_REPLACEMENTS];
 static int archive_replacement_count;
 
 #define MAX_VERTICES 4096
+#define MAX_EDGE_VERTICES 512
 typedef struct
 {
    uint32_t color;
@@ -84,8 +85,10 @@ typedef struct
 } OverlayVertex;
 
 static OverlayVertex vertices[MAX_VERTICES] __attribute__((aligned(16)));
+static OverlayVertex edge_vertices[MAX_EDGE_VERTICES] __attribute__((aligned(16)));
 static unsigned int gu_list[4096] __attribute__((aligned(16)));
 static int vertex_count;
+static int edge_vertex_count;
 
 /* Newlib references _exit through abort(), even when that path is never used.
    In a plugin, it must terminate only the thread, never the game. */
@@ -97,7 +100,7 @@ void _exit(int status)
    }
 }
 
-#define LUA_HEAP_SIZE (128 * 1024)
+#define LUA_HEAP_SIZE (192 * 1024)
 #define SCRIPT_MAX_SIZE (16 * 1024)
 typedef struct HeapBlock
 {
@@ -254,6 +257,45 @@ static int api_text(lua_State *s)
    return 0;
 }
 
+static int api_line(lua_State *s)
+{
+   int x0 = luaL_checkinteger(s, 1), y0 = luaL_checkinteger(s, 2);
+   int x1 = luaL_checkinteger(s, 3), y1 = luaL_checkinteger(s, 4);
+   int dx = x1 > x0 ? x1 - x0 : x0 - x1, sx = x0 < x1 ? 1 : -1;
+   int dy_abs = y1 > y0 ? y1 - y0 : y0 - y1, dy = -dy_abs, sy = y0 < y1 ? 1 : -1;
+   int error = dx + dy;
+   uint32_t c = rgba(luaL_optinteger(s, 5, 255), luaL_optinteger(s, 6, 255), luaL_optinteger(s, 7, 255), luaL_optinteger(s, 8, 255));
+   for (;;)
+   {
+      pixel(x0, y0, c);
+      if (x0 == x1 && y0 == y1) break;
+      if (2 * error >= dy) { error += dy; x0 += sx; }
+      if (2 * error <= dx) { error += dx; y0 += sy; }
+   }
+   return 0;
+}
+
+static int api_edge(lua_State *s)
+{
+   OverlayVertex *a, *b;
+   int x0 = luaL_checkinteger(s, 1), y0 = luaL_checkinteger(s, 2);
+   int x1 = luaL_checkinteger(s, 3), y1 = luaL_checkinteger(s, 4);
+   uint32_t c = rgba(luaL_optinteger(s, 5, 255), luaL_optinteger(s, 6, 255),
+                     luaL_optinteger(s, 7, 255), luaL_optinteger(s, 8, 255));
+   if (edge_vertex_count + 2 > MAX_EDGE_VERTICES)
+      return 0;
+   a = &edge_vertices[edge_vertex_count++];
+   b = &edge_vertices[edge_vertex_count++];
+   a->color = b->color = c;
+   a->x = (short)x0;
+   a->y = (short)y0;
+   a->z = 0;
+   b->x = (short)x1;
+   b->y = (short)y1;
+   b->z = 0;
+   return 0;
+}
+
 static uintptr_t address(lua_State *s, int arg, size_t size)
 {
    uintptr_t a = (uintptr_t)luaL_checkinteger(s, arg);
@@ -277,6 +319,14 @@ static uintptr_t address(lua_State *s, int arg, size_t size)
 READ_API(api_read8, uint8_t)
 READ_API(api_read16, uint16_t) READ_API(api_read32, uint32_t)
     WRITE_API(api_write8, uint8_t) WRITE_API(api_write16, uint16_t) WRITE_API(api_write32, uint32_t) static int mod_path_allowed(const char *path) { return path && !strncmp(path, "ms0:/mods/", 10) && strstr(path, "..") == NULL; }
+
+static int api_read_float(lua_State *s)
+{
+   float value;
+   memcpy(&value, (const void *)address(s, 1, sizeof(value)), sizeof(value));
+   lua_pushnumber(s, value);
+   return 1;
+}
 
 static void sync_code(void *start, unsigned int size)
 {
@@ -435,7 +485,7 @@ static int api_mod_replace_archive_file(lua_State *s)
    if (i == archive_replacement_count && archive_replacement_count >= MAX_ARCHIVE_REPLACEMENTS)
       return luaL_error(s, "archive replacement limit reached");
    input = sceIoOpen(source, PSP_O_RDONLY, 0);
-   if (input < 0) return luaL_error(s, "could not open %s: 0x%08X", source, (unsigned int)input);
+   if (input < 0) return luaL_error(s, "could not open %s: error %d", source, (int)input);
    length = sceIoLseek32(input, 0, PSP_SEEK_END);
    sceIoLseek32(input, 0, PSP_SEEK_SET);
    if (length <= 0)
@@ -456,7 +506,7 @@ static int api_mod_replace_archive_file(lua_State *s)
    if (output < 0)
    {
       sceIoClose(input);
-      return luaL_error(s, "could not create nativePSP file: 0x%08X", (unsigned int)output);
+      return luaL_error(s, "could not create nativePSP file: error %d", (int)output);
    }
    size_header = (uint32_t)length;
    result = sceIoWrite(output, &size_header, sizeof(size_header));
@@ -475,7 +525,7 @@ static int api_mod_replace_archive_file(lua_State *s)
    if (result != (int)sizeof(size_header))
       return luaL_error(s, "could not write nativePSP replacement");
    result = update_archive_bitmap(file_id, 1);
-   if (result < 0) return luaL_error(s, "could not update FILE.BIN: 0x%08X", (unsigned int)result);
+   if (result < 0) return luaL_error(s, "could not update FILE.BIN: error %d", (int)result);
    if (i == archive_replacement_count)
    {
       archive_replacement_count++;
@@ -529,7 +579,7 @@ static int api_memory_dump(lua_State *s)
    address(s, 2, size);
    fd = sceIoOpen(path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
    if (fd < 0)
-      return luaL_error(s, "could not create %s: 0x%08X", path, (unsigned int)fd);
+      return luaL_error(s, "could not create %s: error %d", path, (int)fd);
    while (written < size)
    {
       unsigned int chunk = (unsigned int)(size - written);
@@ -540,13 +590,30 @@ static int api_memory_dump(lua_State *s)
       if (result != (int)chunk)
       {
          sceIoClose(fd);
-         return luaL_error(s, "dump failed at %d: 0x%08X", (int)written, (unsigned int)result);
+         return luaL_error(s, "dump failed at %d: error %d", (int)written, (int)result);
       }
       written += chunk;
    }
    sceIoClose(fd);
    lua_pushinteger(s, (lua_Integer)written);
    return 1;
+}
+
+static int api_mod_append_log(lua_State *s)
+{
+   const char *path = luaL_checkstring(s, 1);
+   size_t length;
+   const char *message = luaL_checklstring(s, 2, &length);
+   SceUID fd;
+   int written;
+   luaL_argcheck(s, mod_path_allowed(path), 1, "log must be under ms0:/mods and cannot contain ..");
+   luaL_argcheck(s, length <= MOD_BIN_MAX_SIZE, 2, "log entry is too large");
+   fd = sceIoOpen(path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_APPEND, 0777);
+   if (fd < 0) return luaL_error(s, "could not open log: error %d", (int)fd);
+   written = sceIoWrite(fd, message, (unsigned int)length);
+   sceIoClose(fd);
+   if (written != (int)length) return luaL_error(s, "could not append log: %d/%d", written, (int)length);
+   return 0;
 }
 
 static int api_mod_load_bin(lua_State *s)
@@ -558,7 +625,7 @@ static int api_mod_load_bin(lua_State *s)
    luaL_argcheck(s, mod_path_allowed(path), 1, "file must be under ms0:/mods and cannot contain ..");
    fd = sceIoOpen(path, PSP_O_RDONLY, 0);
    if (fd < 0)
-      return luaL_error(s, "could not open %s: 0x%08X", path, (unsigned int)fd);
+      return luaL_error(s, "could not open %s: error %d", path, (int)fd);
    length = sceIoLseek32(fd, 0, PSP_SEEK_END);
    sceIoLseek32(fd, 0, PSP_SEEK_SET);
    if (length <= 0 || length > MOD_BIN_MAX_SIZE)
@@ -585,7 +652,7 @@ static int api_mod_load_lua(lua_State *s)
    luaL_argcheck(s, mod_path_allowed(path), 1, "script must be under ms0:/mods and cannot contain ..");
    fd = sceIoOpen(path, PSP_O_RDONLY, 0);
    if (fd < 0)
-      return luaL_error(s, "could not open %s: 0x%08X", path, (unsigned int)fd);
+      return luaL_error(s, "could not open %s: error %d", path, (int)fd);
    length = sceIoLseek32(fd, 0, PSP_SEEK_END);
    sceIoLseek32(fd, 0, PSP_SEEK_SET);
    if (length <= 0 || length > MOD_BIN_MAX_SIZE)
@@ -662,7 +729,7 @@ static int api_mod_load_state(lua_State *s)
    length = sceIoRead(fd, mod_file_buffer, MOD_BIN_MAX_SIZE);
    sceIoClose(fd);
    if (length < 0)
-      return luaL_error(s, "could not read state: 0x%08X", (unsigned int)length);
+      return luaL_error(s, "could not read state: error %d", (int)length);
    lua_pushlstring(s, (const char *)mod_file_buffer, (size_t)length);
    return 1;
 }
@@ -679,7 +746,7 @@ static int api_mod_save_state(lua_State *s)
    state_path(s, game_id, path);
    fd = sceIoOpen(path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
    if (fd < 0)
-      return luaL_error(s, "could not create state: 0x%08X", (unsigned int)fd);
+      return luaL_error(s, "could not create state: error %d", (int)fd);
    written = sceIoWrite(fd, data, (unsigned int)length);
    sceIoClose(fd);
    if (written != (int)length)
@@ -786,9 +853,11 @@ static int api_game_id(lua_State *s)
    lua_pushnil(s);
    return 1;
 }
-static const luaL_Reg overlay_api[] = {{"rect", api_rect}, {"text", api_text}, {NULL, NULL}};
+static const luaL_Reg overlay_api[] = {{"rect", api_rect}, {"text", api_text}, {"line", api_line},
+                                       {"edge", api_edge}, {NULL, NULL}};
 
 static const luaL_Reg memory_api[] = {{"read8", api_read8}, {"read16", api_read16}, {"read32", api_read32}, 
+                                       {"read_float", api_read_float},
                                        {"write8", api_write8}, {"write16", api_write16}, {"write32", api_write32}, 
                                        {"dump", api_memory_dump}, {NULL, NULL}};
 
@@ -796,6 +865,7 @@ static const luaL_Reg mods_api[] = {{"list", api_mod_list}, {"load_state", api_m
                                     {"load_lua", api_mod_load_lua}, {"load_bin", api_mod_load_bin}, {"hook32", api_mod_hook32}, 
                                     {"redirect_file", api_mod_redirect_file},
                                     {"replace_archive_file", api_mod_replace_archive_file},
+                                    {"append_log", api_mod_append_log},
                                     {"disable", api_mod_disable}, {"is_active", api_mod_active}, {NULL, NULL}};
 
 static unsigned int button_mask(const char *name)
@@ -949,9 +1019,12 @@ static void call_draw(void)
 
 static void render_overlay(void *target, int target_stride, int target_format)
 {
-   if (!target || vertex_count == 0)
+   if (!target || (vertex_count == 0 && edge_vertex_count == 0))
       return;
-   sceKernelDcacheWritebackRange(vertices, (unsigned int)(vertex_count * sizeof(OverlayVertex)));
+   if (vertex_count > 0)
+      sceKernelDcacheWritebackRange(vertices, (unsigned int)(vertex_count * sizeof(OverlayVertex)));
+   if (edge_vertex_count > 0)
+      sceKernelDcacheWritebackRange(edge_vertices, (unsigned int)(edge_vertex_count * sizeof(OverlayVertex)));
    sceGuStart(GU_DIRECT, gu_list);
    sceGuDrawBufferList(target_format, (void *)((uintptr_t)target & 0x001fffff), target_stride);
    sceGuOffset(2048 - 240, 2048 - 136);
@@ -963,7 +1036,11 @@ static void render_overlay(void *target, int target_stride, int target_format)
    sceGuDisable(GU_CULL_FACE);
    sceGuEnable(GU_BLEND);
    sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
-   sceGuDrawArray(GU_SPRITES, GU_COLOR_8888 | GU_VERTEX_16BIT | GU_TRANSFORM_2D, vertex_count, NULL, vertices);
+   if (vertex_count > 0)
+      sceGuDrawArray(GU_SPRITES, GU_COLOR_8888 | GU_VERTEX_16BIT | GU_TRANSFORM_2D, vertex_count, NULL, vertices);
+   if (edge_vertex_count > 0)
+      sceGuDrawArray(GU_LINES, GU_COLOR_8888 | GU_VERTEX_16BIT | GU_TRANSFORM_2D,
+                     edge_vertex_count, NULL, edge_vertices);
    sceGuFinish();
    sceGuSync(0, 0);
 }
@@ -991,6 +1068,7 @@ static int overlay_thread(SceSize args, void *argp)
          load_script();
       held = combo;
       vertex_count = 0;
+      edge_vertex_count = 0;
       call_draw();
       if (script_status < 0)
       {
