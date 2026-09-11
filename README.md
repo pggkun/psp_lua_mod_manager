@@ -93,7 +93,9 @@ START+SELECT reloads `main.lua` after the core is running.
 
 - `overlay.rect(x, y, width, height, r, g, b, a)`
 - `overlay.text(text, x, y, scale, r, g, b, a)`
+- `overlay.line(x1, y1, x2, y2, r, g, b, a)`
 - `memory.read8/16/32(address)`
+- `memory.read_float(address)`
 - `memory.write8/16/32(address, value)`
 - `memory.dump(path, address, size)`
 - `mods.list()`
@@ -101,6 +103,9 @@ START+SELECT reloads `main.lua` after the core is running.
 - `mods.load_bin(path, address)`
 - `mods.load_lua(path)`
 - `mods.hook32(owner, address, opcode[, original])`
+- `mods.redirect_file(owner, disc_path, replacement_path)`
+- `mods.replace_archive_file(owner, file_id, replacement_path)` (FUComplete `NATIVEPSP`)
+- `mods.append_log(path, text)`
 - `mods.disable(owner)` and `mods.is_active(owner)`
 - `system.game_id()`, `system.free_memory()`, and `system.time()`
 - `input.down(button)` and `input.pressed(button)`
